@@ -1,4 +1,3 @@
-# repo.py
 import json
 import logging
 from datetime import datetime
@@ -7,14 +6,11 @@ from typing import List, Optional
 # Caso use psycopg2, o import deve estar aqui ou no chamador
 import psycopg2
 
-
 # Configuração básica de logging
-# (Você pode customizar melhor, criando handlers e formatters)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-
 
 # =========================================
 # ============= DOMAIN MODELS ============
@@ -93,19 +89,22 @@ class ContractParser:
     def parse(json_str: str) -> Contrato:
         data = json.loads(json_str)
 
-        oc_data = data.get("orgao_contratante", {})
+        # Garantir que "orgao_contratante" exista, se não, será um dicionário vazio
+        oc_data = data.get("orgao_contratante") or {}
         orgao_contratante = OrgaoContratante(
             razao_social=oc_data.get("razao_social", ""),
             sigla=oc_data.get("sigla"),
             cnpj=oc_data.get("cnpj", "")
         )
 
-        ec_data = data.get("empresa_contratada", {})
+        # Garantir que "empresa_contratada" exista, se não, será um dicionário vazio
+        ec_data = data.get("empresa_contratada") or {}
         empresa_contratada = EmpresaContratada(
             razao_social=ec_data.get("razao_social", ""),
             cnpj=ec_data.get("cnpj", "")
         )
 
+        # Garantir que os itens estão presentes, caso contrário, será uma lista vazia
         itens_list = []
         for item_data in data.get("itens", []):
             item = Item(
@@ -136,10 +135,18 @@ class ContractParser:
         )
         return contrato
 
-
 # =========================================
 # ========== REPOSITORY CLASS =============
 # =========================================
+
+def is_valid_catmat(catmat: Optional[str]) -> bool:
+    """
+    Verifica se o catmat/catser é somente dígitos e tem mais de 2 dígitos.
+    """
+    if not catmat:
+        return False
+    return catmat.isdigit() and len(catmat) > 2
+
 
 class ContractRepository:
     """
@@ -329,6 +336,7 @@ class ContractRepository:
         log_msg = "Contrato processado com sucesso."
         data_contrato_sql = None
 
+        # Tentando converter data de celebração
         if contrato.data_celebracao:
             try:
                 data_contrato_sql = datetime.strptime(
@@ -336,6 +344,19 @@ class ContractRepository:
                 ).date()
             except ValueError:
                 data_contrato_sql = None
+
+        # -----------------------------------------------------------------
+        # FILTRAR itens que não tenham catmat/catser válido, antes de inserir.
+        valid_items = []
+        for item in contrato.itens:
+            if is_valid_catmat(item.catmat_catser):
+                valid_items.append(item)
+            else:
+                self.logger.info(
+                    f"[persist_contract] Descartando item com catmat_catser inválido: {item.catmat_catser}"
+                )
+        contrato.itens = valid_items
+        # -----------------------------------------------------------------
 
         qtd_itens = len(contrato.itens)
 
@@ -371,3 +392,141 @@ class ContractRepository:
             except Exception as e_log:
                 self.logger.error("Falha ao registrar log do extrator.", exc_info=True)
 
+
+def generate_sql_script(contrato: Contrato, filename: str) -> str:
+    """
+    Gera um script SQL (string) com as instruções de INSERT
+    para orgao, empresa, contrato e itens, para o schema precos (v4).
+    Retorna uma string que você pode salvar num arquivo .sql.
+
+    Também filtra os itens que não tenham catmat_catser válido,
+    de forma a não gerar inserts para itens inválidos.
+    """
+    script_lines = []
+    # 1) Orgao Contratante
+    orgao_cnpj = contrato.orgao_contratante.cnpj
+    orgao_razao = (contrato.orgao_contratante.razao_social or "").replace("'", "''")
+    orgao_sigla = (contrato.orgao_contratante.sigla or "").replace("'", "''")
+    script_lines.append(f"""--
+-- Inserindo Orgao Contratante
+INSERT INTO precos.orgao_contratante (razao_social, sigla, cnpj)
+VALUES ('{orgao_razao}', '{orgao_sigla}', '{orgao_cnpj}')
+ON CONFLICT (cnpj) DO NOTHING;
+""")
+    # 2) Empresa Contratada
+    emp_cnpj = contrato.empresa_contratada.cnpj
+    emp_razao = (contrato.empresa_contratada.razao_social or "").replace("'", "''")
+    script_lines.append(f"""--
+-- Inserindo Empresa Contratada
+INSERT INTO precos.empresa_contratada (razao_social, cnpj)
+VALUES ('{emp_razao}', '{emp_cnpj}')
+ON CONFLICT (cnpj) DO NOTHING;
+""")
+    # 3) Contrato com WITH para capturar o ID
+    data_sql = "NULL"
+    if contrato.data_celebracao:
+        data_sql = f"TO_DATE('{contrato.data_celebracao}', 'DD/MM/YYYY')"
+    numero_contrato = (contrato.numero_contrato or "").replace("'", "''")
+    tipo_instrumento = (contrato.tipo_instrumento or "").replace("'", "''")
+    processo_adm = (contrato.processo_administrativo or "").replace("'", "''")
+    fonte_preco = (contrato.fonte_preco or "").replace("'", "''")
+    ref_contrato = (contrato.referencia_contrato or "").replace("'", "''")
+
+    url_pdf = f"s3://compras-ia-np/Contratos/{filename}"
+    status = (contrato.status_extracao or "").replace("'", "''")
+
+    script_lines.append(f"""--
+-- Inserindo Contrato e Itens em uma única transação
+WITH contrato_inserido AS (
+  INSERT INTO precos.contratos (
+    numero_contrato,
+    tipo_instrumento,
+    processo_administrativo,
+    data_celebracao,
+    fonte_preco,
+    referencia_contrato,
+    url_pdf_s3,
+    status_extracao,
+    orgao_contratante_id,
+    empresa_contratada_id
+  )
+  VALUES (
+    '{numero_contrato}',
+    '{tipo_instrumento}',
+    '{processo_adm}',
+    {data_sql},
+    '{fonte_preco}',
+    '{ref_contrato}',
+    '{url_pdf}',  -- Caminho para o PDF no S3
+    '{status}',
+    (SELECT id FROM precos.orgao_contratante WHERE cnpj = '{orgao_cnpj}' LIMIT 1),
+    (SELECT id FROM precos.empresa_contratada WHERE cnpj = '{emp_cnpj}' LIMIT 1)
+  )
+  RETURNING id
+)""")
+
+    # 4) Itens - filtrar itens inválidos
+    valid_items = [it for it in contrato.itens if is_valid_catmat(it.catmat_catser)]
+    if valid_items:
+        for i, item in enumerate(valid_items):
+            desc = (item.descricao or "").replace("'", "''")
+            espec = (item.especificacao or "").replace("'", "''")
+            um = (item.unidade_medida or "").replace("'", "''")
+
+            qtd = (item.quantidade or "").replace("'", "")
+            val_unit = (item.valor_unitario or "").replace("'", "")
+            val_total = (item.valor_total or "").replace("'", "")
+            catmat = (item.catmat_catser or "").replace("'", "")
+
+            tipo = (item.tipo or "").replace("'", "''")
+            locais = (item.locais_execucao_entrega or "").replace("'", "''")
+
+            if i == 0:
+                script_lines.append(f"""--
+-- Inserindo Itens usando o ID do contrato inserido
+INSERT INTO precos.itens (
+  contrato_id,
+  descricao,
+  especificacao,
+  unidade_medida,
+  quantidade,
+  valor_unitario,
+  valor_total,
+  catmat_catser,
+  tipo,
+  locais_execucao_entrega
+)
+SELECT
+  contrato_inserido.id,
+  '{desc}',
+  '{espec}',
+  '{um}',
+  '{qtd}',
+  '{val_unit}',
+  '{val_total}',
+  '{catmat}',
+  '{tipo}',
+  '{locais}'
+FROM contrato_inserido""")
+            else:
+                script_lines.append(f"""UNION ALL
+SELECT
+  contrato_inserido.id,
+  '{desc}',
+  '{espec}',
+  '{um}',
+  '{qtd}',
+  '{val_unit}',
+  '{val_total}',
+  '{catmat}',
+  '{tipo}',
+  '{locais}'
+FROM contrato_inserido""")
+        script_lines.append(";")
+    else:
+        # Se não existem itens válidos, apenas concluímos a CTE
+        script_lines.append("""
+SELECT id FROM contrato_inserido;
+""")
+
+    return "\n".join(script_lines)

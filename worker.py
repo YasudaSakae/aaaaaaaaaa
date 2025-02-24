@@ -1,4 +1,3 @@
-# worker.py
 import os
 import json
 import time
@@ -11,8 +10,7 @@ from botocore.exceptions import NoCredentialsError
 import google.generativeai as genai
 import concurrent.futures
 from datetime import datetime
-
-# Importar as classes do repo.py
+# Importar as classes do repo.y
 from repo import ContractParser, ContractRepository
 
 # Criar diretório de logs
@@ -52,7 +50,7 @@ CONFIG = {
     },
     'gemini': {
         'api_key': 'AIzaSyAykyWUpxP0KUh_JhLtYMKl0gXq1IzzWBY',
-        'model': 'gemini-pro',
+        'model': 'gemini-2.0-flash',
         'timeout': 120
     }
 }
@@ -84,11 +82,14 @@ class AWSConnector:
             return False
     
     def connect_to_database(self):
-        """Conecta ao banco de dados através do túnel SSH."""
+        """
+        Conecta ao banco de dados através do túnel SSH (se quisesse usar).
+        (Comentado, pois não vamos persistir no DB agora.)
+        """
         if not self.tunnel or not self.tunnel.is_active:
             if not self.open_ssh_tunnel():
                 return None
-                
+
         try:
             conn = psycopg2.connect(
                 host='localhost',
@@ -104,40 +105,43 @@ class AWSConnector:
             logger.error(f"Erro ao conectar ao banco via túnel SSH: {e}")
             return None
     
-    def upload_to_s3(self, content, s3_key):
-        """Faz upload de conteúdo para o S3 com re-tentativas."""
-        max_attempts = 3
-        attempt = 0
-        
-        while attempt < max_attempts:
-            attempt += 1
-            try:
-                s3_client = boto3.client('s3', region_name=self.config['s3']['region'])
-                
-                if isinstance(content, str):
-                    s3_client.put_object(
-                        Bucket=self.config['s3']['bucket'],
-                        Key=s3_key,
-                        Body=content.encode('utf-8'),
-                        ContentType='application/json'
-                    )
-                else:
-                    s3_client.put_object(
-                        Bucket=self.config['s3']['bucket'],
-                        Key=s3_key,
-                        Body=content
-                    )
-                return True
-            except NoCredentialsError:
-                logger.error("Credenciais da AWS não encontradas.")
-                return False
-            except Exception as e:
-                if attempt == max_attempts:
-                    logger.error(f"Erro ao fazer upload para S3 após {max_attempts} tentativas: {e}")
-                    return False
-                else:
-                    logger.warning(f"Tentativa {attempt} falhou. Tentando novamente em 5s... Erro: {e}")
-                    time.sleep(5)
+    # Comentei o código relacionado ao S3
+    # def upload_to_s3(self, content, s3_key):
+    #     """Faz upload de conteúdo (string JSON ou bytes PDF) para o S3."""
+    #     max_attempts = 3
+    #     attempt = 0
+    #     
+    #     while attempt < max_attempts:
+    #         attempt += 1
+    #         try:
+    #             s3_client = boto3.client('s3', region_name=self.config['s3']['region'])
+    #             
+    #             if isinstance(content, str):
+    #                 # Se é string, presumimos JSON
+    #                 s3_client.put_object(
+    #                     Bucket=self.config['s3']['bucket'],
+    #                     Key=s3_key,
+    #                     Body=content.encode('utf-8'),
+    #                     ContentType='application/json'
+    #                 )
+    #             else:
+    #                 # Caso contrário, assumimos binário (PDF)
+    #                 s3_client.put_object(
+    #                     Bucket=self.config['s3']['bucket'],
+    #                     Key=s3_key,
+    #                     Body=content
+    #                 )
+    #             return True
+    #         except NoCredentialsError:
+    #             logger.error("Credenciais da AWS não encontradas.")
+    #             return False
+    #         except Exception as e:
+    #             if attempt == max_attempts:
+    #                 logger.error(f"Erro ao fazer upload para S3 após {max_attempts} tentativas: {e}")
+    #                 return False
+    #             else:
+    #                 logger.warning(f"Tentativa {attempt} falhou. Tentando novamente em 5s... Erro: {e}")
+    #                 time.sleep(5)
     
     def close(self):
         """Fecha o túnel SSH se estiver ativo."""
@@ -145,22 +149,19 @@ class AWSConnector:
             self.tunnel.stop()
 
 
-def analyze_with_gemini(self, text):
+def analyze_with_gemini(text):
     """
-    Analisa o texto do PDF usando a API Gemini, agora com o prompt que
-    extrai as informações de contrato e gera o JSON.
-    O model_name será obtido de self.model_entry (entry Tkinter), e 
-    o timeout, da CONFIG (ou onde você preferir).
+    Analisa o texto do PDF usando a API Gemini, gera o JSON conforme prompt fixo.
     """
     start_time = time.time()
     
     try:
-        # Configurar credencial da API
+        # Configurar a credencial da API
         genai.configure(api_key=CONFIG['gemini']['api_key'])
         
-        # Escolher o modelo a partir do que o usuário digitou na GUI
+        # Cria um modelo com as configs
         model = genai.GenerativeModel(
-            model_name=self.model_entry.get().strip(),
+            model_name=CONFIG['gemini']['model'],
             generation_config={
                 "temperature": 0,
                 "top_p": 0.95,
@@ -168,12 +169,12 @@ def analyze_with_gemini(self, text):
             }
         )
         
-        # Se o texto for muito grande, truncar para 30000 caracteres
+        # Truncar se for muito grande
         if len(text) > 30000:
             logger.info(f"Texto muito longo ({len(text)} chars), truncando para 30000.")
             text = text[:30000]
         
-        # Novo prompt
+        # Prompt fixo
         prompt = f"""Você é um especialista em análise de contratos públicos. Sua tarefa é extrair as informações essenciais de um contrato ou termo administrativo de forma precisa e estruturada.
         Analise o documento a seguir e gere um JSON rigorosamente no seguinte formato (sem comentários ou texto adicional):
 
@@ -229,13 +230,11 @@ Regras para Extração:
 - *Anexo do contrato*: incluir o caminho ou link de acesso.
 - *Status da extração*: "Sucesso" se todas as informações forem extraídas, "Parcial" se faltar alguma, ou "Erro" se a extração falhar.
 
-*Texto para análise:*
+- *Texto para análise:*
 {text}
 """
 
         timeout = CONFIG['gemini']['timeout']
-        
-        # Usar um executor para tratar timeout
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(model.generate_content, prompt)
@@ -244,14 +243,14 @@ Regras para Extração:
                 response_text = response.text
                 duration = time.time() - start_time
                 
-                # Tentar converter a resposta para JSON diretamente
+                # Verificar se é JSON válido
                 try:
                     json.loads(response_text)
                     logger.info(f"Análise Gemini concluída em {duration:.2f}s")
                     return response_text, True
                 except json.JSONDecodeError:
-                    # Se não for JSON válido, tentar extrair
                     logger.error("Resultado não é um JSON válido.")
+                    # Tentar extrair bloco JSON
                     json_start = response_text.find('{')
                     json_end = response_text.rfind('}') + 1
                     if json_start >= 0 and json_end > json_start:
@@ -262,8 +261,6 @@ Regras para Extração:
                             return json_only, True
                         except:
                             pass
-                    
-                    # Se chegou aqui, não deu para parsear como JSON
                     snippet = response_text[:100].replace('\n', ' ')
                     return f"Resultado não é um JSON válido: {snippet}...", False
                 
@@ -276,14 +273,8 @@ Regras para Extração:
         logger.error(f"Erro ao analisar com Gemini após {duration:.2f}s: {e}")
         return str(e), False
 
+
 def process_document_with_ai(doc_data):
-    """
-    Fluxo principal executado pelos workers:
-    1. Recebe texto extraído do PDF
-    2. Processa com Gemini
-    3. Salva no banco de dados via SSH
-    4. Faz upload do JSON para S3
-    """
     start_time = time.time()
     filename = doc_data['filename']
     result = {
@@ -291,13 +282,13 @@ def process_document_with_ai(doc_data):
         'success': False,
         'processing_time': 0,
         'error': None,
-        'steps_completed': []
+        'steps_completed': [],
+        'extracted_json': None
     }
     
     logger.info(f"Processando documento: {filename}")
-    aws = None
-    conn = None
-    
+    aws = AWSConnector(CONFIG)
+
     try:
         # 1. Analisar texto com Gemini
         text_length = len(doc_data['text'])
@@ -309,54 +300,38 @@ def process_document_with_ai(doc_data):
             result['error'] = f"Falha na análise com Gemini: {json_str}"
             return result
         
-        # 2. Armazenar temporariamente o JSON
+        # Armazenar o JSON gerado na chave 'extracted_json'
+        result['extracted_json'] = json_str
+
+        # 2. Salva JSON local (opcional)
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=TEMP_DIR, suffix='.json') as temp_file:
             temp_json_path = temp_file.name
             temp_file.write(json_str)
         result['steps_completed'].append('json_saved')
-        
-        # 3. Converter JSON para objeto Contrato
+
+        # 3. Parse
         try:
             contrato = ContractParser.parse(json_str)
             result['steps_completed'].append('json_parsed')
         except Exception as e:
             result['error'] = f"Erro ao parsear JSON: {e}"
-            logger.error(f"JSON inválido retornado: {json_str[:500]}...")
+            logger.error(f"JSON inválido: {json_str[:500]}...")
             return result
+
+        # (Banco comentado)
+
+        # 4. Upload PDF binário para S3
+        # pdf_bytes = doc_data.get('pdf_bytes')
+        # if pdf_bytes:
+        #     s3_pdf_key = f"contratos_originais/{filename}"
+        #     pdf_s3_success = aws.upload_to_s3(pdf_bytes, s3_pdf_key)
+        #     if pdf_s3_success:
+        #         result['steps_completed'].append('s3_pdf_uploaded')
+        # else:
+        #     logger.warning("Nenhum PDF binário em doc_data['pdf_bytes'], não será enviado ao S3.")
         
-        # 4. Abrir conexão SSH e com banco
-        aws = AWSConnector(CONFIG)
-        conn = aws.connect_to_database()
-        
-        if not conn:
-            result['error'] = "Falha na conexão com o banco de dados"
-            return result
-        
-        result['steps_completed'].append('db_connected')
-        
-        # 5. Persistir no banco
-        repo = ContractRepository(conn)
-        repo.persist_contract(contrato)
-        result['steps_completed'].append('db_persisted')
-        
-        # 6. Upload do JSON para S3
-        s3_key = f"contratos_analisados/{os.path.splitext(filename)[0]}.json"
-        s3_success = aws.upload_to_s3(json_str, s3_key)
-        if s3_success:
-            result['steps_completed'].append('s3_json_uploaded')
-        
-        # 7. Upload do PDF original para S3 (se disponível)
-        pdf_path = doc_data.get('path')
-        if pdf_path and os.path.exists(pdf_path):
-            with open(pdf_path, 'rb') as pdf_file:
-                pdf_content = pdf_file.read()
-                s3_pdf_key = f"contratos_originais/{filename}"
-                pdf_s3_success = aws.upload_to_s3(pdf_content, s3_pdf_key)
-                if pdf_s3_success:
-                    result['steps_completed'].append('s3_pdf_uploaded')
-        
+        # Final
         result['success'] = True
-        result['s3_upload'] = s3_success
         result['processing_time'] = time.time() - start_time
         logger.info(f"Documento {filename} processado com sucesso em {result['processing_time']:.2f}s")
         
@@ -368,10 +343,7 @@ def process_document_with_ai(doc_data):
     finally:
         # Fechamento
         try:
-            if conn:
-                conn.close()
-            if aws:
-                aws.close()
+            aws.close()
             if 'temp_json_path' in locals() and os.path.exists(temp_json_path):
                 os.unlink(temp_json_path)
         except Exception as close_error:

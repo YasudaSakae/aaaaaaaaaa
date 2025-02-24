@@ -29,16 +29,14 @@ def execute_sql_script(sql_script: str):
     """
     # Ajuste aqui as credenciais do seu banco
     conn = psycopg2.connect(
-        host="54.175.112.114",       # Se seu service Docker se chama "postgres"
+        host="54.175.112.114",  # Ajuste para o host correto
         port=5433,
         database="compras_ia",
         user="compras",
-        password="Sinerji"     # A senha recém-definida
+        password="Sinerji"      # Ajuste para a senha correta
     )
     try:
         with conn.cursor() as cur:
-            # Tenta executar todo o script de uma só vez.
-            # Se ocorrer erro de parsing, podemos precisar de outro método (split por ';').
             cur.execute(sql_script)
         conn.commit()
     finally:
@@ -56,8 +54,7 @@ def select_pdf_directory():
 def move_pdf_to_lidos(pdf_path, dest_dir="PdfLidos"):
     """Move o arquivo PDF para a pasta 'PdfLidos'."""
     if not os.path.exists(dest_dir):
-        os.makedirs(dest_dir)  # Cria a pasta PdfLidos, se não existir
-
+        os.makedirs(dest_dir)
     dest_path = os.path.join(dest_dir, os.path.basename(pdf_path))
     shutil.move(pdf_path, dest_path)
     logger.info(f"Arquivo movido para: {dest_path}")
@@ -67,11 +64,23 @@ def move_pdf_to_lidos(pdf_path, dest_dir="PdfLidos"):
 def move_pdf_to_error(pdf_path, dest_dir="PdfErros"):
     """Move o arquivo PDF para a pasta 'PdfErros' caso ocorra algum erro ao processá-lo."""
     if not os.path.exists(dest_dir):
-        os.makedirs(dest_dir)  # Cria a pasta PdfErros, se não existir
-
+        os.makedirs(dest_dir)
     dest_path = os.path.join(dest_dir, os.path.basename(pdf_path))
     shutil.move(pdf_path, dest_path)
     logger.info(f"Arquivo movido para a pasta de erros: {dest_path}")
+    return dest_path
+
+
+def move_pdf_to_ignorados(pdf_path, dest_dir="PdfIgnorados"):
+    """
+    Move o arquivo PDF para uma pasta de 'ignorados' 
+    (quando detectamos algo no texto que não queremos processar).
+    """
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir)
+    dest_path = os.path.join(dest_dir, os.path.basename(pdf_path))
+    shutil.move(pdf_path, dest_path)
+    logger.warning(f"Arquivo movido para a pasta de ignorados: {dest_path}")
     return dest_path
 
 
@@ -112,15 +121,26 @@ def main():
         for i, pdf_path in enumerate(batch, start=1):
             logger.info(f"Lendo [{i}/{len(batch)}]: '{pdf_path}'")
             try:
+                # Extração do texto
                 text = extract_text_from_pdf(pdf_path)
+
+                # ======= [NOVA REGRA] Ignorar se conter "Contrato de Compra e Venda" =======
+                # Aqui, uso .lower() para deixar a checagem "case-insensitive".
+                if "contrato de compra e venda" in text.lower():
+                    logger.warning(f"O arquivo '{pdf_path}' contém 'Contrato de Compra e Venda'; será ignorado.")
+                    move_pdf_to_ignorados(pdf_path)
+                    continue  # Pula este PDF e vai para o próximo
+
+                # Se chegou aqui, significa que NÃO contém a frase proibida.
                 with open(pdf_path, "rb") as f:
                     pdf_bytes = f.read()
+
                 logger.info(
                     f"Extração concluída, texto com {len(text)} caracteres. "
                     f"Tamanho do PDF em bytes: {len(pdf_bytes)}."
                 )
 
-                # Mover o PDF para a pasta 'PdfLidos'
+                # Move o PDF para a pasta 'PdfLidos' pois passou na checagem
                 moved_pdf_path = move_pdf_to_lidos(pdf_path)
 
             except Exception as e:
@@ -143,7 +163,7 @@ def main():
         logger.info("Submetendo tarefas de processamento para o lote...")
         futures = client.map(process_document_with_ai, doc_data_list)
 
-        # 5. Esperar os resultados do lote
+        # 5. Esperar os resultados dos workers
         logger.info("Aguardando resultados dos workers...")
         results = client.gather(futures)
 
@@ -172,7 +192,7 @@ def main():
                 contrato = ContractParser.parse(extracted_json)
                 sql_script = generate_sql_script(contrato, r['filename'])
                 
-                # Opcionalmente, salvar também o script em arquivo .sql
+                # Opcionalmente, salvar o script em arquivo .sql
                 sql_script_path = os.path.join("results", r['filename'] + "_script.sql")
                 try:
                     with open(sql_script_path, "w", encoding='utf-8') as f:
@@ -181,7 +201,7 @@ def main():
                 except Exception as e:
                     logger.error(f"Falha ao salvar script SQL em '{sql_script_path}': {e}")
 
-                # *** Parte nova: executar automaticamente o script no banco ***
+                # Executar automaticamente o script no banco
                 try:
                     execute_sql_script(sql_script)
                     logger.info("Script SQL executado com sucesso no banco!")
